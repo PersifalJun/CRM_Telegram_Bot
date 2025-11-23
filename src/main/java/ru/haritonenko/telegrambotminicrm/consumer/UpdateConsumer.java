@@ -1,8 +1,12 @@
 package ru.haritonenko.telegrambotminicrm.consumer;
 
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.SneakyThrows;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Component;
 import org.telegram.telegrambots.longpolling.util.LongPollingSingleThreadUpdateConsumer;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
@@ -10,201 +14,437 @@ import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.message.Message;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup;
+import org.telegram.telegrambots.meta.api.objects.replykeyboard.ReplyKeyboardRemove;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardButton;
 import org.telegram.telegrambots.meta.api.objects.replykeyboard.buttons.InlineKeyboardRow;
 import org.telegram.telegrambots.meta.generics.TelegramClient;
+import ru.haritonenko.telegrambotminicrm.model.Lead;
 import ru.haritonenko.telegrambotminicrm.model.User;
+import ru.haritonenko.telegrambotminicrm.repository.LeadRepository;
 import ru.haritonenko.telegrambotminicrm.service.UserService;
 
-import java.util.List;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Component
 @RequiredArgsConstructor
+@Slf4j
 public class UpdateConsumer implements LongPollingSingleThreadUpdateConsumer {
 
+    @Value("${admin.ids:}")
+    private String adminIdsRaw;
     @Value("${app.pagination.default-page:0}")
     private int defaultPage;
-
     @Value("${app.pagination.default-size:20}")
     private int defaultSize;
-
     @Value("${app.pagination.max-size:100}")
     private int maxSize;
 
+    private Set<Long> adminIds;
     private final TelegramClient telegramClient;
     private final UserService userService;
+    private final LeadRepository leadRepository;
+    private static final DateTimeFormatter LEAD_DT_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
+
+    @PostConstruct
+    void initAdmins() {
+        if (adminIdsRaw == null || adminIdsRaw.isBlank()) {
+            adminIds = Collections.emptySet();
+            return;
+        }
+        adminIds = Arrays.stream(adminIdsRaw.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .map(Long::parseLong)
+                .collect(Collectors.toSet());
+        log.info("Admin ids initialized: {}", adminIds);
+        if (defaultPage < 0) defaultPage = 0;
+        if (defaultSize <= 0) defaultSize = 20;
+        if (maxSize <= 0) maxSize = 100;
+    }
+
+    private int pageSize() {
+        return Math.min(defaultSize, maxSize);
+    }
+
+    private boolean isAdmin(Long chatId) {
+        return adminIds.contains(chatId);
+    }
+
+    private void ensureUserExists(Message message) {
+        Long chatId = message.getChatId();
+        if (userService.getByChatId(chatId).isPresent()) {
+            return;
+        }
+        var from = message.getFrom();
+        var user = User.builder()
+                .chatId(chatId)
+                .username(from != null ? from.getUserName() : null)
+                .firstName(from != null ? from.getFirstName() : null)
+                .lastName(from != null ? from.getLastName() : null)
+                .notify(false)
+                .build();
+        userService.save(user);
+        log.info("New user created: chatId={}", chatId);
+    }
 
     @Override
     public void consume(Update update) {
         if (update == null) return;
 
-        if (update.hasCallbackQuery()) {
-            handleCallbackQuery(update.getCallbackQuery());
-            return;
-        }
+        try {
+            if (update.hasCallbackQuery()) {
+                log.debug("Received callback query");
+                handleCallbackQuery(update.getCallbackQuery());
+                return;
+            }
 
-        if (update.hasMessage()) {
-            Message msg = update.getMessage();
-            if (!msg.hasText()) return;
+            if (!update.hasMessage()) return;
+            Message message = update.getMessage();
+            Long chatId = message.getChatId();
+            if (!message.hasText()) return;
 
-            String text = msg.getText().trim();
-            Long chatId = msg.getChatId();
+            ensureUserExists(message);
 
-            try {
-                String reply;
-                if (text.equals("/start") || text.equals("/help")) {
-                    sendMainMenu(chatId);
-                    return;
-                } else if (text.startsWith("/add")) {
-                    reply = handleAdd(text);
-                } else if (text.startsWith("/user_id")) {
-                    reply = handleGetById(text);
-                } else if (text.startsWith("/by_phone")) {
-                    reply = handleByPhone(text);
-                } else if (text.startsWith("/by_district")) {
-                    reply = handleByDistrict(text);
-                } else if (text.startsWith("/by_source")) {
-                    reply = handleBySource(text); // <-- было handleByDistrict
+            String text = message.getText().trim();
+            log.info("Received message from chatId={}: {}", chatId, text);
+
+            String reply;
+
+            if (text.equals("/start") || text.equals("/help")) {
+                hideReplyKeyboard(chatId);
+                sendMainMenu(chatId);
+                return;
+            } else if (text.startsWith("/user_id")) {
+                reply = handleGetById(text);
+            } else if (text.startsWith("/by_phone")) {
+                reply = handleByPhone(text);
+            } else if (text.equals("/notify_me")) {
+                var existing = userService.getByChatId(chatId);
+                if (existing.isPresent()) {
+                    var u = existing.get();
+                    if (Boolean.TRUE.equals(u.getNotify())) {
+                        reply = "Вы уже подписаны ✅";
+                    } else {
+                        u.setNotify(true);
+                        if (message.getFrom() != null) {
+                            u.setUsername(message.getFrom().getUserName());
+                            u.setFirstName(message.getFrom().getFirstName());
+                            u.setLastName(message.getFrom().getLastName());
+                        }
+                        userService.save(u);
+                        reply = "Подписка включена ✅";
+                    }
                 } else {
-                    reply = "Не знаю такую команду. Напишите /help";
+                    var u = User.builder()
+                            .chatId(chatId)
+                            .username(message.getFrom() != null ? message.getFrom().getUserName() : null)
+                            .firstName(message.getFrom() != null ? message.getFrom().getFirstName() : null)
+                            .lastName(message.getFrom() != null ? message.getFrom().getLastName() : null)
+                            .notify(true)
+                            .build();
+                    userService.save(u);
+                    reply = "Вы подписаны на рассылку ✅";
                 }
-                sendMessage(chatId, reply);
-            } catch (Exception e) {
+                log.info("Notify command processed for chatId={}", chatId);
+            } else if (text.equals("/notify_off")) {
+                var opt = userService.getByChatId(chatId);
+                if (opt.isEmpty()) {
+                    reply = "У вас нет активной подписки.";
+                } else {
+                    var u = opt.get();
+                    if (!Boolean.TRUE.equals(u.getNotify())) {
+                        reply = "Подписка уже выключена.";
+                    } else {
+                        u.setNotify(false);
+                        userService.save(u);
+                        reply = "Рассылка отключена ❌";
+                    }
+                }
+                log.info("Notify off processed for chatId={}", chatId);
+            } else if (text.equals("/notify_list")) {
+                if (!isAdmin(chatId)) {
+                    reply = "Доступ запрещён.";
+                    log.warn("Notify list access denied for chatId={}", chatId);
+                } else {
+                    sendUsersPage(chatId, defaultPage);
+                    return;
+                }
+            } else if (text.startsWith("/remove")) {
+                if (!isAdmin(chatId)) {
+                    reply = "Доступ запрещён.";
+                    log.warn("Remove access denied for chatId={}", chatId);
+                } else {
+                    String[] parts = text.split("\\s+");
+                    if (parts.length < 2) reply = "Использование: /remove <chatId>";
+                    else {
+                        try {
+                            Long target = Long.parseLong(parts[1]);
+                            userService.deleteByChatId(target);
+                            reply = "Пользователь удалён.";
+                            log.info("User with chatId={} removed by admin chatId={}", target, chatId);
+                        } catch (NumberFormatException nfe) {
+                            reply = "chatId должен быть числом.";
+                            log.warn("Invalid chatId format in /remove from chatId={}", chatId);
+                        }
+                    }
+                }
+            } else if (text.equals("/stop")) {
+                userService.deleteByChatId(chatId);
+                reply = """
+                        Мы удалили ваши данные и больше не будем писать ✅
+
+                        Если захотите вернуться — просто отправьте /start.
+                        """;
+                log.info("User requested stop and was deleted: chatId={}", chatId);
+            } else if (text.equals("/leads")) {
+                sendLeadsPage(chatId, defaultPage);
+                return;
+            } else {
+                reply = "Не знаю такую команду. Напишите /help";
+            }
+
+            sendMessage(chatId, reply);
+        } catch (Exception e) {
+            log.error("Error while processing update", e);
+            if (update != null && update.hasMessage()) {
+                Long chatId = update.getMessage().getChatId();
                 sendMessage(chatId, "Ошибка: " + e.getMessage());
             }
         }
     }
 
-    private String handleAdd(String text) {
-        String payload = text.length() > 4 ? text.substring(4).trim() : "";
-        String[] parts = payload.split(";");
-        if (parts.length < 5) {
-            return """
-                    Неверный формат. Пример:
-                    /add Иванов Иван; +7(999)123-45-67; ЦАО; Telegram; 2
-                    """;
-        }
-        String fio = parts[0].trim();
-        String phone = parts[1].trim();
-        String district = parts[2].trim();
-        String source = parts[3].trim();
-        int quantity;
-        try {
-            quantity = Integer.parseInt(parts[4].trim());
-        } catch (NumberFormatException e) {
-            return "quantity должно быть целым числом.";
-        }
-
-        var u = userService.addUser(fio, phone, district, source, quantity);
-
-        return """
-                Пользователь добавлен ✅
-                id=%d
-                ФИО=%s
-                Телефон=%s
-                Район=%s
-                Source=%s
-                Кол-во=%d
-                """.formatted(
-                u.getId(), u.getFio(),
-                UserService.normalizePhone(u.getPhone()),
-                u.getDistrict(), u.getSource(), u.getQuantity()
-        );
+    private String formatUserShort(User u) {
+        String uname = u.getUsername() != null ? ("@" + u.getUsername()) : "-";
+        String phone = u.getPhone() != null ? UserService.normalizePhone(u.getPhone()) : "-";
+        return "%d | chatId=%d | %s | %s | notify=%s"
+                .formatted(u.getId(), u.getChatId(), uname, phone, u.getNotify());
     }
 
     private String handleGetById(String text) {
         String[] parts = text.split("\\s+");
-        if (parts.length < 2) return "Укажите id: /user_id 42";
+        if (parts.length < 2) return "Укажите id: /user_id <id>";
         Long id = Long.parseLong(parts[1]);
         return userService.getById(id)
-                .map(this::formatUser)
+                .map(this::formatUserShort)
                 .orElse("Не найден пользователь с id=" + id);
     }
 
     private String handleByPhone(String text) {
         String[] parts = text.split("\\s+", 2);
-        if (parts.length < 2) return "Укажите телефон: /by_phone +79991234567";
-        var list = userService.findByPhone(parts[1].trim());
-        if (list.isEmpty()) return "Пользователи не найдены";
-        return list.stream().map(this::formatUser).collect(Collectors.joining("\n\n"));
+        if (parts.length < 2) return "Укажите телефон: /by_phone <phone>";
+        return userService.getByPhone(parts[1].trim())
+                .map(this::formatUserShort)
+                .orElse("Не найдено");
     }
 
-    private String handleByDistrict(String text) {
-        String[] parts = text.split("\\s+", 2);
-        if (parts.length < 2) return "Укажите район: /by_district ЦАО";
-        int size = Math.min(defaultSize, maxSize);
-        var page = userService.findByDistrict(parts[1].trim(), defaultPage, size);
-        if (page.isEmpty()) return "Ничего не найдено";
-        return page.stream().map(this::formatUser).collect(Collectors.joining("\n\n"));
+    private void sendLeadsPage(Long chatId, int pageNumber) {
+        if (pageNumber < 0) {
+            sendMessage(chatId, "Заявок нет.");
+            return;
+        }
+
+        var pageable = PageRequest.of(pageNumber, pageSize(), Sort.by(Sort.Direction.ASC, "id"));
+        var page = leadRepository.findAll(pageable);
+
+        if (page.isEmpty()) {
+            sendMessage(chatId, "Заявок нет.");
+            return;
+        }
+
+        List<Lead> leads = page.getContent();
+
+        StringBuilder sb = new StringBuilder("Последние заявки (страница ")
+                .append(pageNumber + 1)
+                .append("):\n\n");
+
+        for (Lead l : leads) {
+            String created = l.getCreatedAt() != null ? l.getCreatedAt().format(LEAD_DT_FMT) : "-";
+            sb.append("#").append(l.getId())
+                    .append(" | ").append(l.getFio())
+                    .append(" | ").append(l.getPhone())
+                    .append(" | ").append(l.getDistrict())
+                    .append(" | ").append(l.getSource())
+                    .append(" | кол-во=").append(l.getQuantity())
+                    .append(" | сумма=").append(l.getAmount())
+                    .append(" | ").append(created)
+                    .append("\n\n");
+        }
+
+        InlineKeyboardMarkup keyboard = buildPaginationKeyboard("leads_page", pageNumber, page.hasPrevious(), page.hasNext());
+        sendMessage(chatId, sb.toString(), keyboard);
+        log.info("Leads page {} sent to chatId={}", pageNumber, chatId);
     }
 
-    private String handleBySource(String text) {
-        String[] parts = text.split("\\s+", 2);
-        if (parts.length < 2) return "Укажите source: /by_source Telegram";
-        int size = Math.min(defaultSize, maxSize);
-        var page = userService.findBySource(parts[1].trim(), defaultPage, size);
-        if (page.isEmpty()) return "Ничего не найдено";
-        return page.stream().map(this::formatUser).collect(Collectors.joining("\n\n"));
+    private void sendUsersPage(Long chatId, int pageNumber) {
+        if (pageNumber < 0) {
+            sendMessage(chatId, "Пользователей нет.");
+            return;
+        }
+
+        var pageable = PageRequest.of(pageNumber, pageSize(), Sort.by(Sort.Direction.ASC, "id"));
+        var page = userService.findNotifyOn(pageable);
+
+        if (page.isEmpty()) {
+            sendMessage(chatId, "Пользователей нет.");
+            return;
+        }
+
+        List<User> users = page.getContent();
+
+        StringBuilder sb = new StringBuilder("Подписчики (страница ")
+                .append(pageNumber + 1)
+                .append("):\n\n");
+
+        for (User u : users) {
+            sb.append(formatUserShort(u)).append("\n\n");
+        }
+
+        InlineKeyboardMarkup keyboard = buildPaginationKeyboard("users_page", pageNumber, page.hasPrevious(), page.hasNext());
+        sendMessage(chatId, sb.toString(), keyboard);
+        log.info("Users page {} sent to chatId={}", pageNumber, chatId);
     }
 
-    private String formatUser(User u) {
-        return "id=%d\nФИО=%s\nТелефон=%s\nРайон=%s\nSource=%s\nКол-во=%d"
-                .formatted(
-                        u.getId(), u.getFio(),
-                        UserService.normalizePhone(u.getPhone()),
-                        u.getDistrict(), u.getSource(), u.getQuantity()
-                );
-    }
+    private InlineKeyboardMarkup buildPaginationKeyboard(String prefix, int pageNumber, boolean hasPrev, boolean hasNext) {
+        List<InlineKeyboardRow> rows = new ArrayList<>();
+        List<InlineKeyboardButton> navButtons = new ArrayList<>();
 
+        if (hasPrev) {
+            navButtons.add(InlineKeyboardButton.builder()
+                    .text("⬅️ Previous")
+                    .callbackData(prefix + ":" + (pageNumber - 1))
+                    .build());
+        }
+        if (hasNext) {
+            navButtons.add(InlineKeyboardButton.builder()
+                    .text("Next ➡️")
+                    .callbackData(prefix + ":" + (pageNumber + 1))
+                    .build());
+        }
+
+        if (!navButtons.isEmpty()) {
+            rows.add(new InlineKeyboardRow(navButtons));
+        }
+
+        return rows.isEmpty() ? null : new InlineKeyboardMarkup(rows);
+    }
 
     @SneakyThrows
     private void sendMainMenu(Long chatId) {
         var message = SendMessage.builder()
                 .text("""
-                                        Добро пожаловать! Выберите действие:
-                        1).Добавить пользователя
-                        2).Поиск пользователя по id
-                        3).Поиск пользователя по телефону
-                        4).Поиск пользователя по району 
-                        5).Поиск пользователя по source""")
+                        Доступные команды:
+                        
+                        /user_id <id>
+                        /by_phone <телефон>
+                        /leads — последние заявки
+                        
+                        Подписка на рассылку:
+                        /notify_me — подписать текущий чат на рассылку уведомлений
+                        /notify_off — отписаться от рассылки
+                        /notify_list — список подписанных пользователей (для админов)
+                        /remove <chatId> — удалить подписчика (для админов)
+                        /stop — прекратить общение и удалить ваши данные
+                        
+                        """)
                 .chatId(chatId)
                 .build();
 
-        var kb = new InlineKeyboardMarkup(List.of(
-                new InlineKeyboardRow(InlineKeyboardButton.builder().text("Добавить пользователя").callbackData("add_user").build()),
-                new InlineKeyboardRow(InlineKeyboardButton.builder().text("Поиск пользователя по id").callbackData("search_by_id").build()),
-                new InlineKeyboardRow(InlineKeyboardButton.builder().text("Поиск пользователя по телефону").callbackData("search_by_phone").build()),
-                new InlineKeyboardRow(InlineKeyboardButton.builder().text("Поиск пользователя по району").callbackData("search_by_district").build()),
-                new InlineKeyboardRow(InlineKeyboardButton.builder().text("Поиск пользователя по source").callbackData("search_by_source").build())
+        var keyBoard = new InlineKeyboardMarkup(List.of(
+                new InlineKeyboardRow(
+                        InlineKeyboardButton.builder().text("Поиск по id").callbackData("search_by_id").build()
+                ),
+                new InlineKeyboardRow(
+                        InlineKeyboardButton.builder().text("Поиск по телефону").callbackData("search_by_phone").build()
+                ),
+                new InlineKeyboardRow(
+                        InlineKeyboardButton.builder().text("Список заявок").callbackData("list_leads").build()
+                ),
+                new InlineKeyboardRow(
+                        InlineKeyboardButton.builder().text("Подписчики").callbackData("list_users").build()
+                ),
+                new InlineKeyboardRow(
+                        InlineKeyboardButton.builder().text("Прекратить общение").callbackData("stop_chat").build()
+                )
         ));
-        message.setReplyMarkup(kb);
+        message.setReplyMarkup(keyBoard);
         telegramClient.execute(message);
+        log.info("Main menu sent to chatId={}", chatId);
     }
 
     private void handleCallbackQuery(CallbackQuery cb) {
         Long chatId = cb.getMessage().getChatId();
         String data = cb.getData();
+        log.info("Callback query from chatId={}, data={}", chatId, data);
+
+        if (data.startsWith("leads_page:")) {
+            int page = Integer.parseInt(data.substring("leads_page:".length()));
+            sendLeadsPage(chatId, page);
+            return;
+        }
+        if (data.startsWith("users_page:")) {
+            int page = Integer.parseInt(data.substring("users_page:".length()));
+            sendUsersPage(chatId, page);
+            return;
+        }
 
         switch (data) {
-            case "add_user" ->
-                    sendMessage(chatId, "Введите команду в чат в одном сообщении:\n/add ФИО;телефон;район;source;quantity");
-            case "search_by_id" -> sendMessage(chatId, "Введите: /user_id <id>\nНапример: /user_id 1");
+            case "search_by_id" ->
+                    sendMessage(chatId, "Введите: /user_id <id>\nНапример: /user_id 1");
             case "search_by_phone" ->
                     sendMessage(chatId, "Введите: /by_phone <телефон>\nНапример: /by_phone +7(999)123-45-67");
-            case "search_by_district" ->
-                    sendMessage(chatId, "Введите: /by_district <район>\nНапример: /by_district ЦАО");
-            case "search_by_source" ->
-                    sendMessage(chatId, "Введите: /by_source <source>\nНапример: /by_source Telegram");
-            default -> sendMessage(chatId, "Неизвестная команда");
+            case "list_leads" -> {
+                sendLeadsPage(chatId, defaultPage);
+                log.info("Leads list sent via callback to chatId={}", chatId);
+            }
+            case "list_users" -> {
+                if (!isAdmin(chatId)) {
+                    sendMessage(chatId, "Доступ запрещён.");
+                    log.warn("list_users access denied for chatId={}", chatId);
+                } else {
+                    sendUsersPage(chatId, defaultPage);
+                }
+            }
+            case "stop_chat" -> {
+                userService.deleteByChatId(chatId);
+                sendMessage(chatId, """
+                        Мы удалили ваши данные и больше не будем писать ✅
+
+                        Если захотите вернуться — просто отправьте /start.
+                        """);
+                log.info("User deleted via stop_chat callback: chatId={}", chatId);
+            }
+            default ->
+                    sendMessage(chatId, "Неизвестная команда");
         }
     }
 
     @SneakyThrows
     private void sendMessage(Long chatId, String messageText) {
-        telegramClient.execute(SendMessage.builder()
+        sendMessage(chatId, messageText, null);
+    }
+
+    @SneakyThrows
+    private void sendMessage(Long chatId, String messageText, InlineKeyboardMarkup keyboard) {
+        SendMessage.SendMessageBuilder builder = SendMessage.builder()
                 .text(messageText)
+                .chatId(chatId.toString());
+        if (keyboard != null) {
+            builder.replyMarkup(keyboard);
+        }
+        telegramClient.execute(builder.build());
+        log.debug("Sent message to chatId={}", chatId);
+    }
+
+    @SneakyThrows
+    private void hideReplyKeyboard(Long chatId) {
+        var message = SendMessage.builder()
                 .chatId(chatId.toString())
-                .build());
+                .text("Добро пожаловать!")
+                .replyMarkup(new ReplyKeyboardRemove(true))
+                .build();
+        telegramClient.execute(message);
+        log.debug("Reply keyboard removed for chatId={}", chatId);
     }
 }

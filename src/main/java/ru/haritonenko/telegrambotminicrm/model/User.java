@@ -7,17 +7,21 @@ import lombok.*;
 import java.time.OffsetDateTime;
 
 @Entity
-@Table( schema = "minicrm",
-        name = "crm_user",
+@Table(
+        schema = "minicrm",
+        name = "tg_users",
         indexes = {
-                @Index(name = "ix_crm_user_district", columnList = "district"),
-                @Index(name = "ix_crm_user_source",   columnList = "source")
+                @Index(name = "ix_tg_user_notify", columnList = "notify")
+        },
+        uniqueConstraints = {
+                @UniqueConstraint(name = "ux_tg_user_chat_id", columnNames = {"chat_id"})
         }
 )
-@Data
-@Builder
-@NoArgsConstructor(access = AccessLevel.PUBLIC)
+@Getter
+@Setter
+@NoArgsConstructor
 @AllArgsConstructor
+@Builder
 @EqualsAndHashCode(of = "id")
 public class User {
 
@@ -25,22 +29,26 @@ public class User {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
-    @NotBlank @Size(min = 2, max = 150)
-    private String fio;
+    @Column(name = "chat_id", nullable = false, unique = true)
+    private Long chatId;
 
-    @NotBlank(message = "Необходимо указать телефон")
-    @Pattern(regexp = "^[+\\d][\\d\\s()\\-]{8,}$")
-    @Column(nullable = false)
+    @Size(max = 50, message = "Максимальная длина никнейма 60 знаков")
+    @Column(name = "username")
+    private String username;
+
+    @Size(max = 15, message = "Максимальная длина символов телефона 15 знаков")
+    @Column(name = "phone")
     private String phone;
 
-    @NotBlank(message = "Необходимо указать место проживания")
-    private String district;
+    @Size(max = 50, message = "Максимальная длина символов имени 50 знаков")
+    @Column(name = "first_name")
+    private String firstName;
+    @Size(max = 50, message = "Максимальная длина фамилии 50 знаков")
+    @Column(name = "last_name")
+    private String lastName;
 
-    @NotBlank(message = "Необходимо указать источник")
-    private String source;
-
-    @NotNull @Min(0)
-    private Integer quantity = 0;
+    @Column(name = "notify", nullable = false)
+    private Boolean notify = false;
 
     @Column(name = "created_at", nullable = false)
     private OffsetDateTime createdAt;

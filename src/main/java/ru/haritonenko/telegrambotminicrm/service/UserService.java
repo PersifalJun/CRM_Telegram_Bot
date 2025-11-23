@@ -1,13 +1,14 @@
 package ru.haritonenko.telegrambotminicrm.service;
 
-import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
-import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.validation.annotation.Validated;
+import ru.haritonenko.telegrambotminicrm.exceptions.UserDeleteException;
+import ru.haritonenko.telegrambotminicrm.exceptions.UserNotFoundException;
 import ru.haritonenko.telegrambotminicrm.model.User;
 import ru.haritonenko.telegrambotminicrm.repository.UserRepository;
 
@@ -17,6 +18,7 @@ import java.util.Optional;
 @Validated
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class UserService {
 
     private final UserRepository userRepository;
@@ -25,25 +27,9 @@ public class UserService {
         if (phone == null) return null;
         String digits = phone.replaceAll("\\D", "");
         if (digits.isEmpty()) return phone;
-        if (digits.length() == 11 && digits.startsWith("8")) {
-            digits = "7" + digits.substring(1);
-        }
-        if (digits.length() == 10) {
-            digits = "7" + digits;
-        }
+        if (digits.length() == 11 && digits.startsWith("8")) digits = "7" + digits.substring(1);
+        if (digits.length() == 10) digits = "7" + digits;
         return "+" + digits;
-    }
-
-    @Transactional
-    public User addUser(@NotBlank String fio,@NotBlank String phone, @NotBlank String district, @NotBlank String source, @NotNull Integer quantity) {
-        User user = User.builder().
-                fio(fio).
-                phone(phone).
-                district(district).
-                source(source).
-                quantity(quantity).
-                build();
-        return userRepository.save(user);
     }
 
     @Transactional(readOnly = true)
@@ -52,17 +38,59 @@ public class UserService {
     }
 
     @Transactional(readOnly = true)
-    public List<User> findByPhone(String phone) {
-        return userRepository.findByPhoneEquivalent(phone);
+    public Optional<User> getByChatId(Long chatId) {
+        return userRepository.findByChatId(chatId);
     }
 
     @Transactional(readOnly = true)
-    public Page<User> findByDistrict(String district, int page, int size) {
-        return userRepository.findByDistrictIgnoreCase(district, PageRequest.of(page, size));
+    public Optional<User> getByUsername(String username) {
+        return userRepository.findByUsernameIgnoreCase(username);
     }
 
     @Transactional(readOnly = true)
-    public Page<User> findBySource(String source, int page, int size) {
-        return userRepository.findBySourceIgnoreCase(source, PageRequest.of(page, size));
+    public Optional<User> getByPhone(String phone) {
+        return userRepository.findByPhone(phone);
+    }
+
+    @Transactional(readOnly = true)
+    public List<User> findNotifyOn() {
+        return userRepository.findByNotifyTrue();
+    }
+
+    @Transactional(readOnly = true)
+    public Page<User> findNotifyOn(Pageable pageable) {
+        return userRepository.findByNotifyTrue(pageable);
+    }
+
+    @Transactional
+    public User save(User u) {
+        User saved = userRepository.save(u);
+        log.info("User saved: id={}, chatId={}", saved.getId(), saved.getChatId());
+        return saved;
+    }
+
+    @Transactional(readOnly = true)
+    public User getRequiredByChatId(Long chatId) {
+        return userRepository.findByChatId(chatId)
+                .orElseThrow(() -> {
+                    log.warn("User with chatId={} not found", chatId);
+                    return new UserNotFoundException("User with chatId=" + chatId + " not found");
+                });
+    }
+
+    @Transactional
+    public void deleteByChatId(Long chatId) {
+        User user = userRepository.findByChatId(chatId)
+                .orElseThrow(() -> {
+                    log.warn("Attempt to delete non-existing user with chatId={}", chatId);
+                    return new UserNotFoundException("User with chatId=" + chatId + " not found");
+                });
+        try {
+            userRepository.delete(user);
+            log.info("User deleted: id={}, chatId={}", user.getId(), chatId);
+        } catch (Exception e) {
+            log.error("Error deleting user with chatId={}", chatId, e);
+            throw new UserDeleteException("Error deleting user with chatId=" + chatId, e);
+        }
     }
 }

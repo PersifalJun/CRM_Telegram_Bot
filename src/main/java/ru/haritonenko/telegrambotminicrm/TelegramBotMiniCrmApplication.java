@@ -7,7 +7,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 public class TelegramBotMiniCrmApplication {
 
     public static void main(String[] args) {
+
         SpringApplication.run(TelegramBotMiniCrmApplication.class, args);
     }
-
 }
