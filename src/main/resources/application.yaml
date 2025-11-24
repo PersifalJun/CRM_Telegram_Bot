@@ -40,8 +40,6 @@ spring:
       platform: postgres
       schema-locations: classpath:db/init/schema.sql
 
-
-
 logging:
   level:
     org.hibernate.SQL: debug
